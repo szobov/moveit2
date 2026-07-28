@@ -1,0 +1,10 @@
+# A single tetrahedron occupying x, y, z in [0, 1].
+o hull_0
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 0 0 1
+f 1 3 2
+f 1 4 3
+f 1 2 4
+f 2 3 4

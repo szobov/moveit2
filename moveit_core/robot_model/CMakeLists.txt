@@ -47,6 +47,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_robot_model test/test.cpp)
   target_link_libraries(test_robot_model moveit_test_utils moveit_robot_model
                         rclcpp::rclcpp)
+
+  ament_add_gtest(test_multi_mesh_collision test/test_multi_mesh_collision.cpp)
+  target_compile_definitions(
+    test_multi_mesh_collision
+    PRIVATE TEST_RESOURCES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/resources")
+  target_link_libraries(test_multi_mesh_collision moveit_robot_model
+                        moveit_robot_state moveit_collision_detection_fcl)
 endif()
 
 install(DIRECTORY include/ DESTINATION include/moveit_core)
