@@ -39,6 +39,7 @@
 #include <geometric_shapes/shape_operations.h>
 #include <rclcpp/logger.hpp>
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <cmath>
 #include <memory>
@@ -1168,6 +1169,19 @@ inline Eigen::Isometry3d urdfPose2Isometry3d(const urdf::Pose& pose)
   Eigen::Isometry3d af(Eigen::Translation3d(pose.position.x, pose.position.y, pose.position.z) * q);
   return af;
 }
+
+/// Whether a URDF geometry is a mesh referencing a Wavefront OBJ file, which may contain multiple objects
+bool isObjMesh(const urdf::Geometry& geom)
+{
+  if (geom.type != urdf::Geometry::MESH)
+    return false;
+  const std::string& filename = static_cast<const urdf::Mesh&>(geom).filename;
+  if (filename.size() < 4)
+    return false;
+  std::string ext = filename.substr(filename.size() - 4);
+  std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+  return ext == ".obj";
+}
 }  // namespace
 
 LinkModel* RobotModel::constructLinkModel(const urdf::Link* urdf_link)
@@ -1186,11 +1200,11 @@ LinkModel* RobotModel::constructLinkModel(const urdf::Link* urdf_link)
   {
     if (col && col->geometry)
     {
-      shapes::ShapeConstPtr s = constructShape(col->geometry.get());
-      if (s)
+      const Eigen::Isometry3d origin = urdfPose2Isometry3d(col->origin);
+      for (const shapes::ShapeConstPtr& s : constructShapes(col->geometry.get()))
       {
         shapes.push_back(s);
-        poses.push_back(urdfPose2Isometry3d(col->origin));
+        poses.push_back(origin);
       }
     }
   }
@@ -1288,6 +1302,39 @@ shapes::ShapePtr RobotModel::constructShape(const urdf::Geometry* geom)
   }
 
   return shapes::ShapePtr(new_shape);
+}
+
+std::vector<shapes::ShapeConstPtr> RobotModel::constructShapes(const urdf::Geometry* geom)
+{
+  std::vector<shapes::ShapeConstPtr> shapes;
+  if (isObjMesh(*geom))
+  {
+    // An OBJ file may contain multiple objects, e.g. the convex pieces of an offline V-HACD
+    // decomposition. Keep each object as an individual shape instead of merging them into
+    // a single mesh.
+    const urdf::Mesh* mesh = static_cast<const urdf::Mesh*>(geom);
+    const Eigen::Vector3d scale(mesh->scale.x, mesh->scale.y, mesh->scale.z);
+    const std::vector<shapes::Mesh*> pieces = shapes::createMeshesFromResource(mesh->filename, scale);
+    shapes.reserve(pieces.size());
+    std::size_t adopted = 0;
+    try
+    {
+      for (; adopted < pieces.size(); ++adopted)
+        shapes.push_back(shapes::ShapeConstPtr(pieces[adopted]));
+    }
+    catch (...)
+    {
+      // The shared_ptr constructor deletes pieces[adopted] itself when it throws; free the rest
+      for (std::size_t i = adopted + 1; i < pieces.size(); ++i)
+        delete pieces[i];
+      throw;
+    }
+  }
+  else if (shapes::ShapeConstPtr shape = constructShape(geom))
+  {
+    shapes.push_back(shape);
+  }
+  return shapes;
 }
 
 bool RobotModel::hasJointModel(const std::string& name) const

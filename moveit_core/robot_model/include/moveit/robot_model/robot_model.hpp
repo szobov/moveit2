@@ -645,6 +645,11 @@ private:
 
   /** \brief Given a geometry spec from the URDF and a filename (for a mesh), construct the corresponding shape object*/
   shapes::ShapePtr constructShape(const urdf::Geometry* geom);
+
+  /** \brief Given a geometry spec from the URDF, construct the corresponding shape objects.
+      A mesh referencing a multi-object OBJ file yields one shape per object; any other geometry
+      yields at most one shape, exactly like constructShape(). */
+  std::vector<shapes::ShapeConstPtr> constructShapes(const urdf::Geometry* geom);
 };
 }  // namespace core
 }  // namespace moveit
