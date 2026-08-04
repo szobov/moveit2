@@ -35,6 +35,7 @@
 /* Author: Ioan Sucan */
 
 #include <moveit/ompl_interface/planning_context_manager.hpp>
+#include <moveit/ompl_interface/detail/cache_planning.hpp>
 #include <moveit/robot_state/conversions.hpp>
 #include <moveit/utils/logger.hpp>
 
@@ -132,10 +133,18 @@ ompl::base::PlannerPtr MultiQueryPlannerAllocator::allocatePlanner(const ob::Spa
     {
       ob::PlannerData data(si);
       planner_map_it->second->getPlannerData(data);
-      RCLCPP_INFO_STREAM(getLogger(), "Reusing planner data. NumEdges: " << data.numEdges()
-                                                                         << ", NumVertices: " << data.numVertices());
-      planners_[planner_map_it->first] = std::shared_ptr<ob::Planner>{ allocatePersistentPlanner<T>(data) };
-      return planners_[planner_map_it->first];
+      if (ob::PlannerPtr planner{ allocatePersistentPlanner<T>(data) })
+      {
+        RCLCPP_INFO_STREAM(getLogger(), "Reusing planner data. NumEdges: " << data.numEdges()
+                                                                           << ", NumVertices: " << data.numVertices());
+        planners_[planner_map_it->first] = planner;
+        return planner;
+      }
+      // Storing the nullptr would silently disable the planner and crash on the next reuse, so fall through to
+      // constructing a fresh instance instead
+      RCLCPP_ERROR(getLogger(),
+                   "Reusing planner data of a '%s' planner is not supported. Going to create a new instance.",
+                   new_name.c_str());
     }
 
     // Certain multi-query planners allow loading and storing the generated planner data. This feature can be
@@ -299,6 +308,7 @@ void PlanningContextManager::registerDefaultPlanners()
   registerPlannerAllocatorHelper<og::BiEST>("geometric::BiEST");
   registerPlannerAllocatorHelper<og::BiTRRT>("geometric::BiTRRT");
   registerPlannerAllocatorHelper<og::BKPIECE1>("geometric::BKPIECE");
+  registerPlannerAllocatorHelper<CachePlanning>("geometric::CachePlanning");
   registerPlannerAllocatorHelper<og::EST>("geometric::EST");
   registerPlannerAllocatorHelper<og::FMT>("geometric::FMT");
   registerPlannerAllocatorHelper<og::KPIECE1>("geometric::KPIECE");

@@ -11,6 +11,7 @@ add_library(
   src/parameterization/joint_space/joint_model_state_space_factory.cpp
   src/parameterization/work_space/pose_model_state_space.cpp
   src/parameterization/work_space/pose_model_state_space_factory.cpp
+  src/detail/cache_planning.cpp
   src/detail/ompl_constraints.cpp
   src/detail/threadsafe_state_storage.cpp
   src/detail/state_validity_checker.cpp
@@ -86,11 +87,24 @@ if(BUILD_TESTING)
   set_target_properties(test_state_validity_checker
                         PROPERTIES LINK_FLAGS "${OpenMP_CXX_FLAGS}")
 
+  ament_add_gtest(test_cache_planning test/test_cache_planning.cpp)
+  target_link_libraries(test_cache_planning moveit_ompl_interface ompl::ompl
+                        Boost::headers)
+  set_target_properties(test_cache_planning PROPERTIES LINK_FLAGS
+                                                       "${OpenMP_CXX_FLAGS}")
+
   ament_add_gtest(test_planning_context_manager
                   test/test_planning_context_manager.cpp)
   target_link_libraries(
     test_planning_context_manager moveit_ompl_interface
     moveit_core::moveit_core tf2_eigen::tf2_eigen Boost::headers Eigen3::Eigen)
+
+  ament_add_gtest(test_cache_planning_context
+                  test/test_cache_planning_context.cpp)
+  target_link_libraries(test_cache_planning_context moveit_ompl_interface
+                        moveit_core::moveit_core Boost::headers Eigen3::Eigen)
+  set_target_properties(test_cache_planning_context
+                        PROPERTIES LINK_FLAGS "${OpenMP_CXX_FLAGS}")
 
   # Disabling flaky test TODO (vatanaksoytezer): Uncomment once this is fixed
   # ament_add_gtest(test_ompl_constraints test/test_ompl_constraints.cpp)

@@ -410,6 +410,10 @@ protected:
   moveit_msgs::msg::Constraints path_constraints_msg_;
   std::vector<kinematic_constraints::KinematicConstraintSetPtr> goal_constraints_;
 
+  /// the request's reference trajectories converted to state space order, handed to planners that can
+  /// reconstruct a previous solution (e.g. CachePlanning) when they are allocated
+  std::vector<std::vector<double>> reference_trajectory_seed_;
+
   const ob::PlannerTerminationCondition* ptc_;
   std::mutex ptc_lock_;
 

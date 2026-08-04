@@ -39,14 +39,17 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/lexical_cast.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <moveit/ompl_interface/model_based_planning_context.hpp>
 #include <moveit/ompl_interface/detail/state_validity_checker.hpp>
+#include <moveit/ompl_interface/detail/cache_planning.hpp>
 #include <moveit/ompl_interface/detail/constrained_sampler.hpp>
 #include <moveit/ompl_interface/detail/constrained_goal_sampler.hpp>
 #include <moveit/ompl_interface/detail/goal_union.hpp>
 #include <moveit/ompl_interface/detail/projection_evaluators.hpp>
 #include <moveit/ompl_interface/detail/constraints_library.hpp>
+#include <moveit/ompl_interface/parameterization/joint_space/joint_model_state_space.hpp>
 
 #include <moveit/kinematic_constraints/utils.hpp>
 
@@ -76,6 +79,103 @@ namespace
 rclcpp::Logger getLogger()
 {
   return moveit::getLogger("moveit.planners.ompl.model_based_planning_context");
+}
+
+/** \brief Convert the reference trajectories of a motion plan request into a seed for CachePlanning.
+ *
+ * The first non-empty joint trajectory among the reference trajectories is used. Its joint values are
+ * reordered to match the state space's variable order; values of mimic variables are recomputed from their
+ * master joints, and columns that do not belong to the group's active joints (e.g. fixed joints exported by
+ * external tooling) are ignored. Returns an empty seed (and warns) when the state space is not a
+ * JointModelStateSpace, an active-joint variable of the group is missing from the trajectory, or a trajectory
+ * point is inconsistent with the trajectory's joint names, so that the planner fails cleanly instead of
+ * reconstructing a wrong trajectory. */
+std::vector<std::vector<double>>
+referenceTrajectoriesToSeed(const std::vector<moveit_msgs::msg::GenericTrajectory>& reference_trajectories,
+                            const ModelBasedStateSpace& state_space)
+{
+  if (state_space.getParameterizationType() != JointModelStateSpace::PARAMETERIZATION_TYPE)
+  {
+    RCLCPP_WARN(getLogger(),
+                "Reference trajectories can only seed planning in a joint model state space, but the state space "
+                "parameterization is '%s'. Set 'enforce_joint_model_state_space: true' for this planner "
+                "configuration. Ignoring the reference trajectories.",
+                state_space.getParameterizationType().c_str());
+    return {};
+  }
+
+  const trajectory_msgs::msg::JointTrajectory* joint_trajectory =
+      [&reference_trajectories]() -> const trajectory_msgs::msg::JointTrajectory* {
+    for (const moveit_msgs::msg::GenericTrajectory& reference_trajectory : reference_trajectories)
+    {
+      for (const trajectory_msgs::msg::JointTrajectory& candidate : reference_trajectory.joint_trajectory)
+      {
+        if (!candidate.points.empty())
+          return &candidate;
+      }
+    }
+    return nullptr;
+  }();
+  if (!joint_trajectory)
+  {
+    RCLCPP_WARN(getLogger(), "The request's reference trajectories contain no non-empty joint trajectory. Ignoring "
+                             "the reference trajectories.");
+    return {};
+  }
+
+  // Only the group's active-joint variables must be present in the trajectory: mimic variables are recomputed
+  // from their master joints (MoveIt's own trajectory export writes active joints only), and other columns are
+  // ignored. Multi-DOF joint variables (e.g. 'joint/x') can never appear among a joint trajectory's joint
+  // names, so groups with multi-DOF joints are rejected through their absence.
+  const moveit::core::JointModelGroup* group = state_space.getJointModelGroup();
+  const std::vector<std::string>& trajectory_joint_names = joint_trajectory->joint_names;
+  std::vector<std::string> required_names;
+  for (const moveit::core::JointModel* joint : group->getActiveJointModels())
+  {
+    required_names.insert(required_names.end(), joint->getVariableNames().begin(), joint->getVariableNames().end());
+  }
+  std::vector<std::size_t> required_columns(required_names.size());
+  for (std::size_t i = 0; i < required_names.size(); ++i)
+  {
+    const auto it = std::find(trajectory_joint_names.begin(), trajectory_joint_names.end(), required_names[i]);
+    if (it == trajectory_joint_names.end())
+    {
+      RCLCPP_WARN(getLogger(),
+                  "The reference trajectory does not contain joint '%s' of group '%s'. Ignoring the reference "
+                  "trajectories.",
+                  required_names[i].c_str(), state_space.getJointModelGroupName().c_str());
+      return {};
+    }
+    required_columns[i] = std::distance(trajectory_joint_names.begin(), it);
+  }
+
+  // Positions are applied through a RobotState so that mimic joint values stay consistent with their masters.
+  // Only positions are read from the trajectory points; velocity/acceleration/effort arrays are ignored.
+  moveit::core::RobotState robot_state(state_space.getRobotModel());
+  robot_state.setToDefaultValues();
+  std::vector<double> required_values(required_names.size());
+  std::vector<std::vector<double>> seed;
+  seed.reserve(joint_trajectory->points.size());
+  for (const trajectory_msgs::msg::JointTrajectoryPoint& point : joint_trajectory->points)
+  {
+    if (point.positions.size() != trajectory_joint_names.size())
+    {
+      RCLCPP_WARN(getLogger(),
+                  "A reference trajectory point has %zu positions but the trajectory names %zu joints. Ignoring the "
+                  "reference trajectories.",
+                  point.positions.size(), trajectory_joint_names.size());
+      return {};
+    }
+    for (std::size_t i = 0; i < required_names.size(); ++i)
+    {
+      required_values[i] = point.positions[required_columns[i]];
+    }
+    robot_state.setVariablePositions(required_names, required_values);
+    std::vector<double> waypoint;
+    robot_state.copyJointGroupPositions(group, waypoint);
+    seed.push_back(std::move(waypoint));
+  }
+  return seed;
 }
 }  // namespace
 
@@ -144,6 +244,19 @@ void ModelBasedPlanningContext::configure(const rclcpp::Node::SharedPtr& node, b
     {
       getOMPLStateSpace()->setInterpolationFunction(constraint_approx->getInterpolationFunction());
       RCLCPP_INFO(getLogger(), "Using precomputed interpolation states");
+    }
+  }
+
+  // Convert the request's reference trajectories before useConfig() installs the planner allocator, which
+  // hands the seed to every planner instance it creates. The conversion only runs for planner types that
+  // consume seeds, so other planners pay nothing for requests that carry reference trajectories.
+  reference_trajectory_seed_.clear();
+  if (!request_.reference_trajectories.empty())
+  {
+    const auto type_it = spec_.config_.find("type");
+    if (type_it != spec_.config_.end() && type_it->second == "geometric::CachePlanning")
+    {
+      reference_trajectory_seed_ = referenceTrajectoriesToSeed(request_.reference_trajectories, *spec_.state_space_);
     }
   }
 
@@ -416,8 +529,18 @@ void ModelBasedPlanningContext::useConfig()
     cfg.erase(it);
     const std::string planner_name = getGroupName() + "/" + name_;
     ompl_simple_setup_->setPlannerAllocator(
-        [planner_name, &spec = spec_, allocator = spec_.planner_selector_(type)](
-            const ompl::base::SpaceInformationPtr& si) { return allocator(si, planner_name, spec); });
+        [this, planner_name, allocator = spec_.planner_selector_(type)](const ompl::base::SpaceInformationPtr& si) {
+          ob::PlannerPtr planner = allocator(si, planner_name, spec_);
+          // Planners that reconstruct a previous solution receive the request's reference trajectories as
+          // their seed. Seeding happens in the allocator so that every planner instance is covered, including
+          // the ones created for parallel planning when num_planning_attempts > 1.
+          if (!reference_trajectory_seed_.empty())
+          {
+            if (auto* cache_planner = dynamic_cast<CachePlanning*>(planner.get()))
+              cache_planner->setSeedTrajectory(reference_trajectory_seed_);
+          }
+          return planner;
+        });
     RCLCPP_INFO(getLogger(),
                 "Planner configuration '%s' will use planner '%s'. "
                 "Additional configuration parameters will be set when the planner is constructed.",
@@ -648,6 +771,13 @@ void ModelBasedPlanningContext::clear()
   ompl_simple_setup_->setStateValidityChecker(ob::StateValidityCheckerPtr());
   path_constraints_.reset();
   goal_constraints_.clear();
+  reference_trajectory_seed_.clear();
+  // The planner instance survives clear() (only setPlannerAllocator resets it) and CachePlanning deliberately
+  // keeps its seed across Planner::clear(), so the seed has to be removed here explicitly
+  if (auto* cache_planner = dynamic_cast<CachePlanning*>(ompl_simple_setup_->getPlanner().get()))
+  {
+    cache_planner->setSeedTrajectory({});
+  }
   getOMPLStateSpace()->setInterpolationFunction(InterpolationFunction());
 }
 
